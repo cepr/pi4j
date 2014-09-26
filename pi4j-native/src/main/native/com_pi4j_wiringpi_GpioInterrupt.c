@@ -59,6 +59,7 @@ struct monitor_data{
    int  edgePin;
    int  lastKnownState;
    int  running;
+   int  poll_fd;
 };
 
 // monitoring thread data structure array
@@ -90,9 +91,10 @@ int monitorPinInterrupt(void *threadarg)
 
     // monitoring instance variables
 	char fn[GPIO_FN_MAXLEN];
-	int fd,ret;
+	int ret;
 	struct pollfd pfd;
 	char rdbuf[RDBUF_LEN];
+	int i;
 
 	// allocate memory
 	memset(rdbuf, 0x00, RDBUF_LEN);
@@ -101,8 +103,8 @@ int monitorPinInterrupt(void *threadarg)
 	// attempt to access the pin state from the linux sysfs
 	// (each GPIO pin value is stored in file: '/sys/class/gpio/gpio#/value' )
 	snprintf(fn, GPIO_FN_MAXLEN-1, "/sys/class/gpio/gpio%d/value", edgePin);
-	fd=open(fn, O_RDONLY);
-	if(fd<0)
+	monitorData->poll_fd=open(fn, O_RDONLY);
+	if(monitorData->poll_fd<0)
 	{
 		// return error; unable to get file descriptor
 		// (this is likely because the pin has not been exported)
@@ -111,11 +113,11 @@ int monitorPinInterrupt(void *threadarg)
 	}
 
 	// set polling config structure
-	pfd.fd=fd;
+	pfd.fd=monitorData->poll_fd;
 	pfd.events=POLLPRI; // High priority data may be read.
 
 	// attempt to read the pin state from the linux sysfs
-	ret=read(fd, rdbuf, RDBUF_LEN-1);
+	ret=read(monitorData->poll_fd, rdbuf, RDBUF_LEN-1);
 	if(ret<0)
 	{
 		// return error; unable to read the data file
@@ -140,7 +142,7 @@ int monitorPinInterrupt(void *threadarg)
 		memset(rdbuf, 0x00, RDBUF_LEN);
 
 		// seek to the fist position in the data file
-		lseek(fd, 0, SEEK_SET);
+		lseek(monitorData->poll_fd, 0, SEEK_SET);
 
 		// wait for data to be written to the GPIO value file
 		// (timeout every 10 seconds and restart)
@@ -151,7 +153,8 @@ int monitorPinInterrupt(void *threadarg)
 		if(ret<0)
 		{
 			perror("poll()");
-			close(fd);
+			close(monitorData->poll_fd);
+			monitorData->poll_fd = -1;
 			return 6;
 		}
 
@@ -168,7 +171,7 @@ int monitorPinInterrupt(void *threadarg)
 		else
 		{
 			// read the data from the file into the data buffer
-			ret=read(fd, rdbuf, RDBUF_LEN-1);
+			ret=read(monitorData->poll_fd, rdbuf, RDBUF_LEN-1);
 			if(ret<0)
 			{
 				// data read error
@@ -191,7 +194,7 @@ int monitorPinInterrupt(void *threadarg)
 				{
 					// get attached JVM
 					JNIEnv *env;
-					(*callback_jvm)->AttachCurrentThread(callback_jvm, (void **)&env, NULL);
+					(*callback_jvm)->AttachCurrentThread(callback_jvm, &env, NULL);
 
 					// ensure that the JVM exists
 					if(callback_jvm != NULL)
@@ -209,7 +212,8 @@ int monitorPinInterrupt(void *threadarg)
 
 	// if we reached this code (unlikely),
 	// then close the data file and exit the thread
-	close(fd);
+	close(monitorData->poll_fd);
+	monitorData->poll_fd = -1;
 	return 0;
 }
 
@@ -275,7 +279,11 @@ JNIEXPORT jint JNICALL Java_com_pi4j_wiringpi_GpioInterrupt_disablePinStateChang
 		// kill the monitoring thread
 		if(monitor_data_array[index].running > 0)
 		{
-			pthread_cancel(threads[index]);
+			// Close the file descriptor used by the monitoring thread
+			// This is more reliable than pthread_cancel()
+			close(monitor_data_array[index].poll_fd);
+			// The thread will die shortly, wait here
+			pthread_join(threads[index], NULL);
 
 			// return '1' when a thread was actively killed
 			return 1;
@@ -301,6 +309,14 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *jvm, void *reserved)
 {
 	JNIEnv *env;
 	jclass cls;
+	int i;
+	
+	// Initialize memory
+	memset(monitor_data_array, 0x00, sizeof(monitor_data_array));
+	for (i = 0; i < MAX_GPIO_PINS; i++) {
+		monitor_data_array[i].poll_fd = -1;
+	}
+	memset(threads, 0x00, sizeof(threads));
 
 	//printf("\nNATIVE (GpioInterrupt) LOADING\n");
 
@@ -359,8 +375,13 @@ JNIEXPORT void JNICALL JNI_OnUnload(JavaVM *jvm, void *reserved)
 	int index = 0;
 	for(index = 0; index < MAX_GPIO_PINS; index++)
 	{
-		if(monitor_data_array[index].running > 0)
-			pthread_cancel(threads[index]);
+		if(monitor_data_array[index].running > 0) {
+			// Close the file descriptor used by the monitoring thread
+			// This is more reliable than pthread_cancel()
+			close(monitor_data_array[index].poll_fd);
+			// The thread will die shortly, wait here
+			pthread_join(threads[index], NULL);
+		}
 	}
 
 	// destroy cached java references
